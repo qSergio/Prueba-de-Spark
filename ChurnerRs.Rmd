@@ -1,0 +1,206 @@
+---
+title: "Prueba de Spark con R en el ambiente de IBM Watson"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+
+Este notebook es un ejercicio de prueba en el que usamos RStudio conectado a Spark para hacer un análisis de un conjunto de datos. Usaremos principalmente las librerías *sparklyr* y *tidyverse*, pero hay otras que también serán de gran utilidad.
+
+
+### Conectando con Spark
+
+
+En el Rstudio que corre en watson se puede revisar las instancias de Spark que se tienen disponibles en el ambiente de trabajo:
+
+```{r}
+library(sparklyr)
+library(tidyverse)
+library(caret)
+library(ROCR)
+
+list_spark_kernels()
+#Y guardamos esta información en una variable
+inst <- list_spark_kernels()
+```
+
+Para conectarnos a esta instancia:
+
+```{r message=FALSE, error=FALSE, warning=FALSE, echo=FALSE}
+#library(sparklyr)
+sc <- spark_connect(config = inst[1]) #El [1] es porque usaremos la primer instancia de la lista. 
+```
+
+Después de establecer la instancia podemos pasar a Spark el famoso archivo de datos de clientes de Telco:
+
+```{r message=FALSE, error=FALSE, warning=FALSE}
+#library(dplyr)
+#Leemos el csv de Telco y lo copiamos a Spark usando "dplyr", esto crea un data frame en Spark y una tabla temporal basada en el data frame local de R
+telco_data <- read.csv("telco_data.csv")
+#telco_muestra <- copy_to(sc, telco_data, "telco", overwrite = TRUE)
+telco_tbl <- copy_to(sc, telco_data, "telco_tbl", overwrite = TRUE)
+#telco_tbl <- spark_read_csv(sc, name="telco_tbl" , path="telco_data.csv")
+src_tbls(sc)
+```
+
+Hacemos una consulta tipo SQL para comprobar que tenemos datos en la tabla:
+
+```{r message=FALSE, error=FALSE, warning=FALSE}
+# Notemos que la consulta es a la tabla generada en Spark: "telco" y no la que está en R que llamamos "telco_data"
+library(DBI)
+consulta <- dbGetQuery(sc, "SELECT * FROM telco_tbl")
+str(consulta)
+```
+
+### Estudiamos los datos
+
+Los datos que vamos a utilizar son los que están basados en spark, es decir el data frame *telco_data*:
+
+```{r}
+summary(telco_data)
+
+```
+
+Vemos que la columna *TotalCharges* contiene NA's. También vemos que *Seniorcitizen* quizá es mejor que sea tipo factor:
+
+```{r}
+
+telco_data <- telco_data %>% mutate_if(is.character, as.factor)
+telco_data$SeniorCitizen <- as.factor(telco_data$SeniorCitizen)
+glimpse(telco_data)
+
+```
+
+Para los valores faltantes, también podemos buscarlos de la siguiente forma:
+
+```{r}
+telco_data %>% map(~ sum(is.na(.)))
+```
+
+Vamos a reemplazar los valores faltantes por la mediana:
+
+```{r}
+telco_data <- telco_data %>%
+  mutate(TotalCharges = replace(TotalCharges,
+                                is.na(TotalCharges),
+                                median(TotalCharges, na.rm = T)))
+sum(is.na(telco_data$TotalCharges))
+```
+
+
+### Exploración
+
+Quizás vale la pena visualizar algunas de las variables categóricas para ver si son estados con cargos totales altos y si acaso son estados en los que los clientes abandonaron el servicio:
+
+```{r}
+# Jubilados
+ggplot(telco_data, aes(x = SeniorCitizen, y = TotalCharges)) +
+  geom_boxplot()
+
+```
+
+```{r}
+# Con Partner
+ggplot(telco_data, aes(x = Partner, y = TotalCharges)) +
+  geom_boxplot()
+```
+
+```{r}
+# Con Dependents
+ggplot(telco_data, aes(x = Dependents, y = TotalCharges)) +
+  geom_boxplot()
+```
+
+Al explorar estas variables, vemos que quizá debemos comparar los cargos totales de los jubilados, de gente sin pareja y sin dependientes.
+
+
+```{r}
+# Caso de jubilados y el promedio de tiempo con el servicio
+telco_data %>%
+  select(SeniorCitizen, Churn, TotalCharges, tenure) %>%
+  filter(SeniorCitizen == 1, Churn == "Yes") %>%
+  summarize(n = n(),
+            total = sum(TotalCharges),
+            avg_tenure = sum(tenure)/n)
+```
+
+
+```{r}
+# Caso de clientes sin pareja y el promedio de tiempo con el servicio
+telco_data %>%
+  select(Partner, Churn, TotalCharges, tenure) %>%
+  filter(Partner == "No", Churn == "Yes") %>%
+  summarise(n = n(),
+            total = sum(TotalCharges),
+            avg_tenure = sum(tenure)/n)
+```
+
+
+```{r}
+# Caso de clientes sin pareja y el promedio de tiempo con el servicio
+telco_data %>%
+  select(Dependents, Churn, TotalCharges, tenure) %>%
+  filter(Dependents == "No", Churn == "Yes") %>%
+  summarise(n = n(),
+            total = sum(TotalCharges),
+            avg_tenure = sum(tenure)/n)
+```
+
+Podemos confirmar que los clientes sin pareja y sin dependientes son los más propensos a abandonar el servicio y sabemos que los cargos totales fueron definitivos.
+
+### Regresión Logística
+
+Vamos a ajustar un modelo de regresión:
+
+```{r message=FALSE, error=FALSE, warning=FALSE}
+#En este momento el ID no es importante
+telco_data <- telco_data %>% select(-customerID)  
+
+set.seed(2018)
+
+Entrena <- createDataPartition(y = telco_data$Churn, p=0.75, list=FALSE)
+
+train <- telco_data[Entrena,]
+test <- telco_data[-Entrena,]
+
+# La regresión logística se conoce también como regresión lineal generalizada, por eso el nombre glm
+logfit <- glm(Churn~., data=train, family=binomial)
+
+# Inferencia
+proba_de_churn <- predict(logfit, test, type="response")
+head(proba_de_churn)
+```
+
+Con lo anterior podemos verificar si el ajuste ha sido adecuado.
+
+```{r}
+glm.pred = rep("No", length(proba_de_churn))
+glm.pred[proba_de_churn > 0.5] = "Yes"
+
+confusionMatrix(factor(glm.pred), factor(test$Churn), positive = "Yes")
+```
+
+
+```{r message=FALSE, error=FALSE, warning=FALSE}
+pr <- prediction(proba_de_churn, test$Churn)
+
+prf <- performance(pr, measure = "tpr", x.measure = "fpr")
+plot(prf)
+```
+
+```{r}
+auc <- performance(pr, measure = "auc")
+auc <- auc@y.values[[1]]
+auc
+```
+
+
+
+
+### Referencias
+
+1. http://rstudio.github.io/sparklyr/articles/guides-dplyr.html
+
+
